@@ -1,6 +1,7 @@
 package client
 
 import (
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -10,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/armon/go-metrics"
@@ -21,7 +21,6 @@ import (
 	"github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/client/driver"
 	"github.com/hashicorp/nomad/client/fingerprint"
-	"github.com/hashicorp/nomad/client/rpcproxy"
 	"github.com/hashicorp/nomad/client/stats"
 	"github.com/hashicorp/nomad/client/vaultclient"
 	"github.com/hashicorp/nomad/command/agent/consul"
@@ -105,26 +104,29 @@ type Client struct {
 
 	logger *log.Logger
 
-	rpcProxy *rpcproxy.RPCProxy
-
 	connPool *nomad.ConnPool
 
-	// lastHeartbeatFromQuorum is an atomic int32 acting as a bool.  When
-	// true, the last heartbeat message had a leader.  When false (0),
-	// the last heartbeat did not include the RPC address of the leader,
-	// indicating that the server is in the minority or middle of an
-	// election.
-	lastHeartbeatFromQuorum int32
+	// servers is the (optionally prioritized) list of nomad servers
+	servers *serverlist
 
-	// consulPullHeartbeatDeadline is the deadline at which this Nomad
-	// Agent will begin polling Consul for a list of Nomad Servers.  When
-	// Nomad Clients are heartbeating successfully with Nomad Servers,
-	// Nomad Clients do not poll Consul to populate their backup server
-	// list.
-	consulPullHeartbeatDeadline time.Time
-	lastHeartbeat               time.Time
-	heartbeatTTL                time.Duration
-	heartbeatLock               sync.Mutex
+	// lastHeartbeatOk is a bool that when true, the last heartbeat
+	// message had a leader.  When false the last heartbeat did not include
+	// the RPC address of the leader, indicating that the server is in the
+	// minority or middle of an election.
+	lastHeartbeatOk bool
+
+	// consulDiscoveryDeadline is the deadline at which this Nomad Agent
+	// will poll Consul for a list of Nomad Servers.  When Nomad Clients
+	// are heartbeating successfully with Nomad Servers, Nomad Clients do
+	// not poll Consul to populate their server list.
+	consulDiscoveryDeadline time.Time
+	lastHeartbeat           time.Time
+	heartbeatTTL            time.Duration
+	heartbeatLock           sync.Mutex
+
+	// discovered will be ticked whenever consul discovery completes
+	// succesfully
+	discovered chan struct{}
 
 	// allocs is the current set of allocations
 	allocs    map[string]*AllocRunner
@@ -154,6 +156,8 @@ type Client struct {
 	vaultClient vaultclient.VaultClient
 }
 
+var noServers = errors.New("no servers")
+
 // NewClient is used to create a new client from the given configuration
 func NewClient(cfg *config.Config, consulSyncer *consul.Syncer, logger *log.Logger) (*Client, error) {
 	// Create the client
@@ -162,6 +166,8 @@ func NewClient(cfg *config.Config, consulSyncer *consul.Syncer, logger *log.Logg
 		consulSyncer:       consulSyncer,
 		start:              time.Now(),
 		connPool:           nomad.NewPool(cfg.LogOutput, clientRPCCache, clientMaxStreams, nil),
+		servers:            newServerList(),
+		discovered:         make(chan struct{}),
 		logger:             logger,
 		hostStatsCollector: stats.NewHostStatsCollector(),
 		allocs:             make(map[string]*AllocRunner),
@@ -202,9 +208,10 @@ func NewClient(cfg *config.Config, consulSyncer *consul.Syncer, logger *log.Logg
 	// Create the RPC Proxy and bootstrap with the preconfigured list of
 	// static servers
 	c.configLock.RLock()
-	c.rpcProxy = rpcproxy.NewRPCProxy(c.logger, c.shutdownCh, c, c.connPool)
-	for _, serverAddr := range c.configCopy.Servers {
-		c.rpcProxy.AddPrimaryServer(serverAddr)
+	if len(c.configCopy.Servers) > 0 {
+		if err := c.SetServers(c.configCopy.Servers); err != nil {
+			logger.Printf("[WARN] None of the configured servers are valid: %v", err)
+		}
 	}
 	c.configLock.RUnlock()
 
@@ -237,16 +244,6 @@ func NewClient(cfg *config.Config, consulSyncer *consul.Syncer, logger *log.Logg
 
 	// Start collecting stats
 	go c.collectHostStats()
-
-	// Start the RPCProxy maintenance task.  This task periodically
-	// shuffles the list of Nomad Server Endpoints this Client will use
-	// when communicating with Nomad Servers via RPC.  This is done in
-	// order to prevent server fixation in stable Nomad clusters.  This
-	// task actively populates the active list of Nomad Server Endpoints
-	// from information from the Nomad Client heartbeats.  If a heartbeat
-	// times out and there are no Nomad servers available, this data is
-	// populated by periodically polling Consul, if available.
-	go c.rpcProxy.Run()
 
 	return c, nil
 }
@@ -358,15 +355,15 @@ func (c *Client) RPC(method string, args interface{}, reply interface{}) error {
 	}
 
 	// Pick a server to request from
-	server := c.rpcProxy.FindServer()
+	server := c.servers.get()
 	if server == nil {
-		return fmt.Errorf("no known servers")
+		return noServers
 	}
 
 	// Make the RPC request
-	if err := c.connPool.RPC(c.Region(), server.Addr, c.RPCMajorVersion(), method, args, reply); err != nil {
-		c.rpcProxy.NotifyFailedServer(server)
-		return fmt.Errorf("RPC failed to server %s: %v", server.Addr, err)
+	if err := c.connPool.RPC(c.Region(), server.addr, c.RPCMajorVersion(), method, args, reply); err != nil {
+		c.servers.mark(server)
+		return fmt.Errorf("RPC failed to server %s: %v", server.addr, err)
 	}
 	return nil
 }
@@ -374,9 +371,6 @@ func (c *Client) RPC(method string, args interface{}, reply interface{}) error {
 // Stats is used to return statistics for debugging and insight
 // for various sub-systems
 func (c *Client) Stats() map[string]map[string]string {
-	toString := func(v uint64) string {
-		return strconv.FormatUint(v, 10)
-	}
 	c.allocLock.RLock()
 	numAllocs := len(c.allocs)
 	c.allocLock.RUnlock()
@@ -386,8 +380,8 @@ func (c *Client) Stats() map[string]map[string]string {
 	stats := map[string]map[string]string{
 		"client": map[string]string{
 			"node_id":         c.Node().ID,
-			"known_servers":   toString(uint64(c.rpcProxy.NumServers())),
-			"num_allocations": toString(uint64(numAllocs)),
+			"known_servers":   strconv.Itoa(len(c.servers.all())),
+			"num_allocations": strconv.Itoa(numAllocs),
 			"last_heartbeat":  fmt.Sprintf("%v", time.Since(c.lastHeartbeat)),
 			"heartbeat_ttl":   fmt.Sprintf("%v", c.heartbeatTTL),
 		},
@@ -438,10 +432,43 @@ func (c *Client) GetAllocFS(allocID string) (allocdir.AllocDirFS, error) {
 	return ar.ctx.AllocDir, nil
 }
 
-// AddPrimaryServerToRPCProxy adds serverAddr to the RPC Proxy's primary
-// server list.
-func (c *Client) AddPrimaryServerToRPCProxy(serverAddr string) *rpcproxy.ServerEndpoint {
-	return c.rpcProxy.AddPrimaryServer(serverAddr)
+// GetServers returns the list of nomad servers this client is aware of.
+func (c *Client) GetServers() []string {
+	endpoints := c.servers.all()
+	res := make([]string, len(endpoints))
+	for i := range endpoints {
+		res[i] = endpoints[i].name
+	}
+	return res
+}
+
+// SetServers sets a new list of nomad servers to connect to. As long as one
+// server is resolvable no error is returned.
+func (c *Client) SetServers(servers []string) error {
+	endpoints := make([]*endpoint, 0, len(servers))
+	var merr multierror.Error
+	for _, s := range servers {
+		addr, err := resolveServer(s)
+		if err != nil {
+			merr.Errors = append(merr.Errors, err)
+			continue
+		}
+
+		// Valid endpoint, append it without a priority as this API
+		// doesn't support different priorities for different servers
+		endpoints = append(endpoints, &endpoint{name: s, addr: addr})
+	}
+
+	// Only return errors if no servers are valid
+	if len(endpoints) == 0 {
+		if len(merr.Errors) > 0 {
+			return merr.ErrorOrNil()
+		}
+		return noServers
+	}
+
+	c.servers.set(endpoints)
+	return nil
 }
 
 // restoreState is used to restore our state from the data dir
@@ -868,14 +895,18 @@ func (c *Client) hasNodeChanged(oldAttrHash uint64, oldMetaHash uint64) (bool, u
 // retryRegisterNode is used to register the node or update the registration and
 // retry in case of failure.
 func (c *Client) retryRegisterNode() {
-	// Register the client
 	for {
-		if err := c.registerNode(); err == nil {
-			break
+		err := c.registerNode()
+		if err == nil {
+			return
+		}
+		if err == noServers {
+			c.logger.Print("[DEBUG] client: registration waiting on servers")
 		} else {
-			c.logger.Printf("[ERR] client: %v", err)
+			c.logger.Printf("[ERR] client: registration failure: %v", err)
 		}
 		select {
+		case <-c.discovered:
 		case <-time.After(c.retryIntv(registerRetryIntv)):
 		case <-c.shutdownCh:
 			return
@@ -917,6 +948,13 @@ func (c *Client) registerNode() error {
 
 // updateNodeStatus is used to heartbeat and update the status of the node
 func (c *Client) updateNodeStatus() error {
+	c.heartbeatLock.Lock()
+	defer c.heartbeatLock.Unlock()
+
+	// Consider this heart as failed unless this gets set to true at the
+	// end of the func
+	c.lastHeartbeatOk = false
+
 	node := c.Node()
 	req := structs.NodeUpdateStatusRequest{
 		NodeID:       node.ID,
@@ -934,14 +972,29 @@ func (c *Client) updateNodeStatus() error {
 		c.logger.Printf("[DEBUG] client: state updated to %s", req.Status)
 	}
 
-	c.heartbeatLock.Lock()
-	defer c.heartbeatLock.Unlock()
+	// Update heartbeat time and ttl
 	c.lastHeartbeat = time.Now()
 	c.heartbeatTTL = resp.HeartbeatTTL
 
-	if err := c.rpcProxy.RefreshServerLists(resp.Servers, resp.NumNodes, resp.LeaderRPCAddr); err != nil {
-		return err
+	// Convert []*NodeServerInfo to []*endpoints
+	localdc := c.Datacenter()
+	endpoints := make([]*endpoint, 0, len(resp.Servers))
+	for _, s := range resp.Servers {
+		addr, err := resolveServer(s.RPCAdvertiseAddr)
+		if err != nil {
+			continue
+		}
+		e := endpoint{name: s.RPCAdvertiseAddr, addr: addr}
+		if s.Datacenter != localdc {
+			// server is non-local; de-prioritize
+			e.priority = 1
+		}
+		endpoints = append(endpoints, &e)
 	}
+	if len(endpoints) == 0 {
+		return fmt.Errorf("server returned no valid servers")
+	}
+	c.servers.set(endpoints)
 
 	// Begin polling Consul if there is no Nomad leader.  We could be
 	// heartbeating to a Nomad server that is in the minority of a
@@ -949,13 +1002,12 @@ func (c *Client) updateNodeStatus() error {
 	// has connectivity to the existing majority of Nomad Servers, but
 	// only if it queries Consul.
 	if resp.LeaderRPCAddr == "" {
-		atomic.CompareAndSwapInt32(&c.lastHeartbeatFromQuorum, 1, 0)
 		return nil
 	}
 
 	const heartbeatFallbackFactor = 3
-	atomic.CompareAndSwapInt32(&c.lastHeartbeatFromQuorum, 0, 1)
-	c.consulPullHeartbeatDeadline = time.Now().Add(heartbeatFallbackFactor * resp.HeartbeatTTL)
+	c.lastHeartbeatOk = true
+	c.consulDiscoveryDeadline = time.Now().Add(heartbeatFallbackFactor * resp.HeartbeatTTL)
 	return nil
 }
 
@@ -1079,9 +1131,13 @@ func (c *Client) watchAllocations(updates chan *allocUpdates) {
 		resp = structs.NodeClientAllocsResponse{}
 		err := c.RPC("Node.GetClientAllocs", &req, &resp)
 		if err != nil {
-			c.logger.Printf("[ERR] client: failed to query for node allocations: %v", err)
+			if err != noServers {
+				c.logger.Printf("[ERR] client: failed to query for node allocations: %v", err)
+			}
 			retry := c.retryIntv(getAllocRetryIntv)
 			select {
+			case <-c.discovered:
+				continue
 			case <-time.After(retry):
 				continue
 			case <-c.shutdownCh:
@@ -1402,23 +1458,17 @@ func (c *Client) deriveToken(alloc *structs.Allocation, taskNames []string, vcli
 // TODO(sean@): this could eventually be moved to a priority queue and give
 // each task an interval, but that is not necessary at this time.
 func (c *Client) setupConsulSyncer() error {
-	// The bootstrapFn callback handler is used to periodically poll
-	// Consul to look up the Nomad Servers in Consul.  In the event the
-	// heartbeat deadline has been exceeded and this Client is orphaned
-	// from its servers, periodically poll Consul to reattach this Client
-	// to its cluster and automatically recover from a detached state.
-	bootstrapFn := func() error {
-		now := time.Now()
+	disco := func() error {
 		c.heartbeatLock.Lock()
+		defer c.heartbeatLock.Unlock()
 
-		// If the last heartbeat didn't contain a leader, give the
-		// Nomad server this Agent is talking to one more attempt at
-		// providing a heartbeat that does contain a leader.
-		if atomic.LoadInt32(&c.lastHeartbeatFromQuorum) == 1 && now.Before(c.consulPullHeartbeatDeadline) {
-			c.heartbeatLock.Unlock()
+		// If the last heartbeat failed or didn't contain a leader,
+		// attempt to heartbeat until deadline before falling back to consul.
+		//
+		// This is the common/healthy path.
+		if c.lastHeartbeatOk && time.Now().Before(c.consulDiscoveryDeadline) {
 			return nil
 		}
-		c.heartbeatLock.Unlock()
 
 		consulCatalog := c.consulSyncer.ConsulClient().Catalog()
 		dcs, err := consulCatalog.Datacenters()
@@ -1437,18 +1487,19 @@ func (c *Client) setupConsulSyncer() error {
 			dcs = dcs[0:lib.MinInt(len(dcs), datacenterQueryLimit)]
 		}
 
-		// Forward RPCs to our region
-		nomadRPCArgs := structs.GenericRequest{
+		// Query for servers in this client's region only
+		region := c.Region()
+		rpcargs := structs.GenericRequest{
 			QueryOptions: structs.QueryOptions{
-				Region: c.Region(),
+				Region: region,
 			},
 		}
 
-		nomadServerServiceName := c.config.ConsulConfig.ServerServiceName
+		serviceName := c.configCopy.ConsulConfig.ServerServiceName
 		var mErr multierror.Error
-		const defaultMaxNumNomadServers = 8
-		nomadServerServices := make([]string, 0, defaultMaxNumNomadServers)
+		var servers endpoints
 		c.logger.Printf("[DEBUG] client.consul: bootstrap contacting following Consul DCs: %+q", dcs)
+	DISCOLOOP:
 		for _, dc := range dcs {
 			consulOpts := &consulapi.QueryOptions{
 				AllowStale: true,
@@ -1456,79 +1507,76 @@ func (c *Client) setupConsulSyncer() error {
 				Near:       "_agent",
 				WaitTime:   consul.DefaultQueryWaitDuration,
 			}
-			consulServices, _, err := consulCatalog.Service(nomadServerServiceName, consul.ServiceTagRPC, consulOpts)
+			consulServices, _, err := consulCatalog.Service(serviceName, consul.ServiceTagRPC, consulOpts)
 			if err != nil {
-				mErr.Errors = append(mErr.Errors, fmt.Errorf("unable to query service %+q from Consul datacenter %+q: %v", nomadServerServiceName, dc, err))
+				mErr.Errors = append(mErr.Errors, fmt.Errorf("unable to query service %+q from Consul datacenter %+q: %v", serviceName, dc, err))
 				continue
 			}
 
 			for _, s := range consulServices {
-				port := strconv.FormatInt(int64(s.ServicePort), 10)
-				addr := s.ServiceAddress
-				if addr == "" {
-					addr = s.Address
+				port := strconv.Itoa(s.ServicePort)
+				addrstr := s.ServiceAddress
+				if addrstr == "" {
+					addrstr = s.Address
 				}
-				serverAddr := net.JoinHostPort(addr, port)
-				serverEndpoint, err := rpcproxy.NewServerEndpoint(serverAddr)
+				addr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(addrstr, port))
 				if err != nil {
 					mErr.Errors = append(mErr.Errors, err)
 					continue
 				}
 				var peers []string
-				if err := c.connPool.RPC(c.Region(), serverEndpoint.Addr, c.RPCMajorVersion(), "Status.Peers", nomadRPCArgs, &peers); err != nil {
+				if err := c.connPool.RPC(region, addr, c.RPCMajorVersion(), "Status.Peers", rpcargs, &peers); err != nil {
 					mErr.Errors = append(mErr.Errors, err)
 					continue
 				}
+
 				// Successfully received the Server peers list of the correct
 				// region
-				if len(peers) != 0 {
-					nomadServerServices = append(nomadServerServices, peers...)
-					break
+				for _, p := range peers {
+					addr, err := net.ResolveTCPAddr("tcp", p)
+					if err != nil {
+						mErr.Errors = append(mErr.Errors, err)
+					}
+					servers = append(servers, &endpoint{name: p, addr: addr})
+				}
+				if len(servers) > 0 {
+					break DISCOLOOP
 				}
 			}
-			// Break if at least one Nomad Server was successfully pinged
-			if len(nomadServerServices) > 0 {
-				break
-			}
 		}
-		if len(nomadServerServices) == 0 {
+		if len(servers) == 0 {
 			if len(mErr.Errors) > 0 {
 				return mErr.ErrorOrNil()
 			}
-
-			return fmt.Errorf("no Nomad Servers advertising service %q in Consul datacenters: %q", nomadServerServiceName, dcs)
+			return fmt.Errorf("no Nomad Servers advertising service %q in Consul datacenters: %+q", serviceName, dcs)
 		}
 
-		// Log the servers we are adding
-		c.logger.Printf("[INFO] client.consul: bootstrap adding following Servers: %q", nomadServerServices)
+		c.logger.Printf("[INFO] client.consul: discovered following Servers: %s", servers)
+		c.servers.set(servers)
 
-		c.heartbeatLock.Lock()
-		if atomic.LoadInt32(&c.lastHeartbeatFromQuorum) == 1 && now.Before(c.consulPullHeartbeatDeadline) {
-			c.heartbeatLock.Unlock()
-			// Common, healthy path
-			if err := c.rpcProxy.SetBackupServers(nomadServerServices); err != nil {
-				return fmt.Errorf("client.consul: unable to set backup servers: %v", err)
-			}
-		} else {
-			c.heartbeatLock.Unlock()
-			// If this Client is talking with a Server that
-			// doesn't have a leader, and we have exceeded the
-			// consulPullHeartbeatDeadline, change the call from
-			// SetBackupServers() to calling AddPrimaryServer()
-			// in order to allow the Clients to randomly begin
-			// considering all known Nomad servers and
-			// eventually, hopefully, find their way to a Nomad
-			// Server that has quorum (assuming Consul has a
-			// server list that is in the majority).
-			for _, s := range nomadServerServices {
-				c.rpcProxy.AddPrimaryServer(s)
+		// Make sure registration is given ample opportunity to run
+		// before trying consul discovery again.
+		c.consulDiscoveryDeadline = c.consulDiscoveryDeadline.Add(2 * registerRetryIntv)
+
+		// Notify waiting rpc calls. Wait briefly in case initial rpc
+		// just failed but the calling goroutine isn't selecting on
+		// discovered yet.
+		const dur = 100 * time.Millisecond
+		timeout := time.NewTimer(dur)
+		for {
+			select {
+			case c.discovered <- struct{}{}:
+				if !timeout.Stop() {
+					<-timeout.C
+				}
+				timeout.Reset(dur)
+			case <-timeout.C:
+				return nil
 			}
 		}
-
-		return nil
 	}
-	if c.config.ConsulConfig.ClientAutoJoin {
-		c.consulSyncer.AddPeriodicHandler("Nomad Client Fallback Server Handler", bootstrapFn)
+	if c.configCopy.ConsulConfig.ClientAutoJoin {
+		c.consulSyncer.AddPeriodicHandler("Nomad Client Consul Server Discovery", disco)
 	}
 
 	consulServicesReaperFn := func() error {
@@ -1617,7 +1665,17 @@ func (c *Client) emitStats(hStats *stats.HostStats) {
 	}
 }
 
-// RPCProxy returns the Client's RPCProxy instance
-func (c *Client) RPCProxy() *rpcproxy.RPCProxy {
-	return c.rpcProxy
+// resolveServer given a sever's address as a string, return it's resolved
+// net.Addr or an error.
+func resolveServer(s string) (net.Addr, error) {
+	const defaultClientPort = "4647" // default client RPC port
+	host, port, err := net.SplitHostPort(s)
+	if err != nil {
+		if strings.Contains(err.Error(), "missing port") {
+			port = defaultClientPort
+		} else {
+			return nil, err
+		}
+	}
+	return net.ResolveTCPAddr("tcp", net.JoinHostPort(host, port))
 }
